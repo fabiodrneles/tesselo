@@ -1,7 +1,7 @@
 // Tesselo – SLICE 5A
 // useGameState: central state manager for a puzzle session.
 
-import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { useState, useMemo, useCallback, useEffect } from "react";
 import {
   generateTesselo,
   getGridSizeForDifficulty,
@@ -9,6 +9,7 @@ import {
   Shape,
   GeneratorResult,
 } from "../utils/generator";
+import { saveProgress, loadProgress } from "../utils/storage";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -38,10 +39,30 @@ export function useGameState(initialDifficulty: Difficulty) {
   const [placedShapes, setPlacedShapes] = useState<Shape[]>([]);
   const [level, setLevel] = useState(1);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Incrementing this value forces the timer useEffect to cleanly restart
+  const [timerEpoch, setTimerEpoch] = useState(0);
+  // True while AsyncStorage is being read on first mount
+  const [isLoadingProgress, setIsLoadingProgress] = useState(true);
 
-  // Start/stop the timer based on victory state
-  const isVictoryRef = useRef(false);
+  // Load saved progress once on mount
+  useEffect(() => {
+    loadProgress().then((saved) => {
+      if (saved) {
+        setDifficulty(saved.difficulty);
+        setLevel(saved.level);
+        setPuzzle(generateTesselo(saved.difficulty));
+        setTimerEpoch((e) => e + 1);
+      }
+      setIsLoadingProgress(false);
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Persist whenever difficulty or level changes (skip initial loading pass)
+  useEffect(() => {
+    if (!isLoadingProgress) {
+      saveProgress(difficulty, level);
+    }
+  }, [difficulty, level, isLoadingProgress]);
 
   // Set of hint positions that already have a confirmed placed shape
   const usedHints = useMemo(
@@ -63,13 +84,23 @@ export function useGameState(initialDifficulty: Difficulty) {
 
   /**
    * Validates a candidate shape:
-   *  1. Its area must equal the value of the hint it covers.
-   *  2. It must not overlap with any already-placed shape.
-   *  3. It must stay within grid bounds.
+   *  1. The hint (hintCol/hintRow) must exist in pendingHints.
+   *  2. The drawn area must match the puzzle's required value for that hint.
+   *  3. The shape must stay within grid bounds.
+   *  4. The shape must not overlap with any already-placed shape.
    */
   const isValidShape = useCallback(
     (newShape: Shape): boolean => {
       const gridSize = puzzle.gridSize;
+
+      // Hint must belong to a pending (not yet solved) puzzle hint
+      const puzzleHint = pendingHints.find(
+        (s) => s.hintCol === newShape.hintCol && s.hintRow === newShape.hintRow
+      );
+      if (!puzzleHint) return false;
+
+      // Area drawn must match the puzzle's required value for that hint
+      if (newShape.width * newShape.height !== puzzleHint.value) return false;
 
       // Bounds check
       if (
@@ -81,21 +112,14 @@ export function useGameState(initialDifficulty: Difficulty) {
         return false;
       }
 
-      // Area must match the hint value
-      if (newShape.width * newShape.height !== newShape.value) {
-        return false;
-      }
-
       // No overlap with confirmed shapes
       for (const placed of placedShapes) {
-        if (shapesOverlap(newShape, placed)) {
-          return false;
-        }
+        if (shapesOverlap(newShape, placed)) return false;
       }
 
       return true;
     },
-    [puzzle.gridSize, placedShapes]
+    [puzzle.gridSize, placedShapes, pendingHints]
   );
 
   /** Adds a validated shape to the board. */
@@ -121,30 +145,42 @@ export function useGameState(initialDifficulty: Difficulty) {
     [pendingHints.length, placedShapes.length, puzzle.shapes.length]
   );
 
-  // Timer: tick every second while not victorious
+  /**
+   * Deadlock detection:
+   * After at least one shape is placed, compare the remaining uncovered area
+   * against the sum of the remaining hint values. If they diverge, the player
+   * placed shapes in positions that make it impossible to cover the full grid
+   * — a restart is needed.
+   */
+  const isDeadlock = useMemo(() => {
+    if (isVictory || placedShapes.length === 0) return false;
+
+    const totalArea = puzzle.gridSize * puzzle.gridSize;
+    const coveredArea = placedShapes.reduce(
+      (sum, s) => sum + s.width * s.height,
+      0
+    );
+    const remainingArea = totalArea - coveredArea;
+    const pendingArea = pendingHints.reduce((sum, s) => sum + s.value, 0);
+
+    return pendingArea !== remainingArea;
+  }, [isVictory, placedShapes, pendingHints, puzzle.gridSize]);
+
+  // Timer: ticks every second. Pauses on victory.
+  // timerEpoch forces a clean restart when the level changes — no race conditions.
   useEffect(() => {
-    isVictoryRef.current = isVictory;
-    if (isVictory) {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-      return;
-    }
-    if (!timerRef.current) {
-      timerRef.current = setInterval(() => {
-        if (!isVictoryRef.current) {
-          setElapsedSeconds((s) => s + 1);
-        }
-      }, 1000);
-    }
-    return () => {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-    };
-  }, [isVictory]);
+    if (isVictory) return;
+    const id = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [timerEpoch, isVictory]);
+
+  /** Restarts the current level with a fresh puzzle (same difficulty). */
+  const restartLevel = useCallback(() => {
+    setPuzzle(generateTesselo(difficulty));
+    setPlacedShapes([]);
+    setElapsedSeconds(0);
+    setTimerEpoch((e) => e + 1);
+  }, [difficulty]);
 
   /** Advances to the next difficulty level and generates a new puzzle. */
   const nextLevel = useCallback(() => {
@@ -155,12 +191,13 @@ export function useGameState(initialDifficulty: Difficulty) {
     setPlacedShapes([]);
     setLevel((l) => l + 1);
     setElapsedSeconds(0);
-    isVictoryRef.current = false;
+    setTimerEpoch((e) => e + 1);
   }, [difficulty]);
 
   return {
     difficulty,
     level,
+    isLoadingProgress,
     elapsedSeconds,
     puzzle,
     placedShapes,
@@ -170,6 +207,8 @@ export function useGameState(initialDifficulty: Difficulty) {
     addShape,
     undoLastShape,
     isVictory,
+    isDeadlock,
+    restartLevel,
     nextLevel,
     gridSize: puzzle.gridSize,
     cellCount: getGridSizeForDifficulty(difficulty),

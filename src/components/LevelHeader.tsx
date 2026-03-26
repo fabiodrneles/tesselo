@@ -3,6 +3,8 @@
 
 import React from "react";
 import { View, Text, StyleSheet } from "react-native";
+import { IconLogo } from "../icons";
+import { formatTime } from "../utils/time";
 
 type LevelHeaderProps = {
   level: number;
@@ -10,12 +12,6 @@ type LevelHeaderProps = {
   completedShapes: number;
   elapsedSeconds: number;
 };
-
-function formatTime(seconds: number): string {
-  const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
-  const ss = String(seconds % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
-}
 
 export default function LevelHeader({
   level,
@@ -25,9 +21,9 @@ export default function LevelHeader({
 }: LevelHeaderProps) {
   return (
     <View style={styles.container}>
-      {/* Left: game title + level */}
-      <View>
-        <Text style={styles.title}>TESSELO</Text>
+      {/* Left: logo SVG + level */}
+      <View style={styles.logoBlock}>
+        <IconLogo size={36} />
         <Text style={styles.level}>Nível {level}</Text>
       </View>
 
@@ -65,11 +61,10 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: "#2D3748",
   },
-  title: {
-    color: "rgba(255,255,255,0.4)",
-    fontSize: 10,
-    fontWeight: "700",
-    letterSpacing: 3,
+  logoBlock: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   level: {
     color: "#FFFFFF",

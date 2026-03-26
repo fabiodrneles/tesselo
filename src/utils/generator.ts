@@ -101,8 +101,14 @@ function subdivide(rect: Rect, minArea: number, totalArea: number): Rect[] {
   let rectB: Rect;
 
   if (splitHorizontal) {
-    // Cut at a random row inside the rectangle (not at the edges)
-    const cutRow = randomInt(1, rect.height - 1);
+    // Both children must have area >= minArea after the cut.
+    // rectA area = rect.width * cutRow  → cutRow >= ceil(minArea / rect.width)
+    // rectB area = rect.width * (rect.height - cutRow) → same lower bound
+    const minRows = Math.ceil(minArea / rect.width);
+    const minCut  = minRows;
+    const maxCut  = rect.height - minRows;
+    if (minCut > maxCut) return [rect]; // can't split without violating minArea
+    const cutRow = randomInt(minCut, maxCut);
     rectA = { col: rect.col, row: rect.row, width: rect.width, height: cutRow };
     rectB = {
       col: rect.col,
@@ -111,8 +117,12 @@ function subdivide(rect: Rect, minArea: number, totalArea: number): Rect[] {
       height: rect.height - cutRow,
     };
   } else {
-    // Cut at a random column inside the rectangle
-    const cutCol = randomInt(1, rect.width - 1);
+    // Same constraint for vertical cuts.
+    const minCols = Math.ceil(minArea / rect.height);
+    const minCut  = minCols;
+    const maxCut  = rect.width - minCols;
+    if (minCut > maxCut) return [rect]; // can't split without violating minArea
+    const cutCol = randomInt(minCut, maxCut);
     rectA = { col: rect.col, row: rect.row, width: cutCol, height: rect.height };
     rectB = {
       col: rect.col + cutCol,

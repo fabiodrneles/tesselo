@@ -7,20 +7,24 @@
 //  - Counter text uses useState (not useAnimatedProps) — compatible with Reanimated 4
 //  - pointerEvents moved to style prop (not deprecated JSX prop)
 
-import React, { useCallback, useState } from "react";
-import { StyleSheet, Text } from "react-native";
+import React, { useCallback, useState, useEffect } from "react";
+import { StyleSheet, Text, View } from "react-native";
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
   runOnJS,
+  runOnUI,
+  withTiming,
+  withSequence,
 } from "react-native-reanimated";
-import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import { Gesture, GestureDetector, State } from "react-native-gesture-handler";
 import { Shape } from "../utils/generator";
 
 // ---------------------------------------------------------------------------
 // Palette – must match tailwind.config.js
 // ---------------------------------------------------------------------------
 
+// Solid hex colors — used for the in-progress rect (opacity via animated style)
 const SHAPE_COLORS = [
   "#4FD1C5", // teal_neon
   "#F6AD55", // orange_sun
@@ -28,11 +32,24 @@ const SHAPE_COLORS = [
   "#FC8181", // coral_soft
 ] as const;
 
+// Semi-transparent rgba variants — used for confirmed placed shapes so that
+// text children (hint numbers) can have full opacity independently.
+const SHAPE_COLORS_PLACED = [
+  "rgba(79,209,197,0.72)",   // teal_neon
+  "rgba(246,173,85,0.72)",   // orange_sun
+  "rgba(183,148,244,0.72)",  // purple_lav
+  "rgba(252,129,129,0.72)",  // coral_soft
+] as const;
+
 const COLOR_SUCCESS = "#68D391";
 const COLOR_OVERLAP = "#FC8181";
 
 function colorForIndex(index: number): string {
   return SHAPE_COLORS[index % SHAPE_COLORS.length];
+}
+
+function placedColorForIndex(index: number): string {
+  return SHAPE_COLORS_PLACED[index % SHAPE_COLORS_PLACED.length];
 }
 
 // ---------------------------------------------------------------------------
@@ -45,6 +62,12 @@ type ShapeDrawerProps = {
   puzzleShapes: Shape[];
   placedShapes: Shape[];
   onShapeComplete: (shape: Shape) => void;
+  /** Called when the player releases with wrong area or overlap — use for haptic error */
+  onShapeRejected?: () => void;
+  /** Called once when a valid hint cell is first touched — use for click sound */
+  onCellTouch?: () => void;
+  /** Called once per drag when the area first equals the required value — use for match sound */
+  onAreaMatch?: () => void;
 };
 
 // ---------------------------------------------------------------------------
@@ -58,22 +81,28 @@ function findHintAt(shapes: Shape[], col: number, row: number): Shape | null {
   return null;
 }
 
-function isCellOccupied(shapes: Shape[], col: number, row: number): boolean {
+/**
+ * Builds a Set of "col,row" keys from all cells occupied by placed shapes.
+ * O(total_placed_area) — runs once per shape placement, not per gesture frame.
+ */
+function buildOccupiedSet(shapes: Shape[]): Set<string> {
+  const set = new Set<string>();
   for (const s of shapes) {
-    if (
-      col >= s.col &&
-      col < s.col + s.width &&
-      row >= s.row &&
-      row < s.row + s.height
-    ) {
-      return true;
+    for (let c = s.col; c < s.col + s.width; c++) {
+      for (let r = s.row; r < s.row + s.height; r++) {
+        set.add(`${c},${r}`);
+      }
     }
   }
-  return false;
+  return set;
 }
 
-function rectangleHasOverlap(
-  placed: Shape[],
+/**
+ * O(drag_area) overlap check using the pre-built occupied set.
+ * Replaces the previous O(drag_area × n_shapes) nested loop.
+ */
+function rectangleHasOverlapFast(
+  occupied: Set<string>,
   sCol: number,
   sRow: number,
   eCol: number,
@@ -81,7 +110,7 @@ function rectangleHasOverlap(
 ): boolean {
   for (let c = sCol; c <= eCol; c++) {
     for (let r = sRow; r <= eRow; r++) {
-      if (isCellOccupied(placed, c, r)) return true;
+      if (occupied.has(`${c},${r}`)) return true;
     }
   }
   return false;
@@ -97,22 +126,31 @@ export default function ShapeDrawer({
   puzzleShapes,
   placedShapes,
   onShapeComplete,
+  onShapeRejected,
+  onCellTouch,
+  onAreaMatch,
 }: ShapeDrawerProps) {
   const totalPixels = cellSize * gridSize;
 
   // ---- Shared values (UI thread) ----
-  const isDrawing   = useSharedValue(false);
-  const startCol    = useSharedValue(0);
-  const startRow    = useSharedValue(0);
-  const endCol      = useSharedValue(0);
-  const endRow      = useSharedValue(0);
-  const requiredValue = useSharedValue(0);
-  const colorIndex  = useSharedValue(0);
-  const currentArea = useSharedValue(0);
+  const isDrawing    = useSharedValue(false);
+  const startCol     = useSharedValue(0);
+  const startRow     = useSharedValue(0);
+  const endCol       = useSharedValue(0);
+  const endRow       = useSharedValue(0);
+  const colorIndex   = useSharedValue(0);
+  const currentArea  = useSharedValue(0);
   const requiredArea = useSharedValue(0);
-  const hasOverlap  = useSharedValue(false);
-  const counterX    = useSharedValue(0);
-  const counterY    = useSharedValue(0);
+  const hasOverlap   = useSharedValue(false);
+  const counterX     = useSharedValue(0);
+  const counterY     = useSharedValue(0);
+
+  // Rejection flash: brief red ghost rect shown when the player releases incorrectly
+  const rejectOpacity = useSharedValue(0);
+  const rejectLeft    = useSharedValue(0);
+  const rejectTop     = useSharedValue(0);
+  const rejectWidth   = useSharedValue(0);
+  const rejectHeight  = useSharedValue(0);
 
   // ---- JS-thread refs ----
   const puzzleShapesRef = React.useRef(puzzleShapes);
@@ -127,15 +165,37 @@ export default function ShapeDrawer({
   // Stores the hint cell position for the current drag (bidirectional anchor)
   const hintPosRef = React.useRef({ col: 0, row: 0 });
 
+  // Mutex: prevents a second gesture from overwriting state before the first
+  // confirmDraw/cancelDraw has resolved on the JS thread.
+  const isProcessingRef = React.useRef(false);
+
+  // Pre-built Set of occupied "col,row" keys — rebuilt once per shape placement,
+  // gives O(1) cell lookup instead of O(n_shapes) per gesture frame.
+  const occupiedCellsRef = React.useRef<Set<string>>(new Set());
+  useEffect(() => {
+    occupiedCellsRef.current = buildOccupiedSet(placedShapes);
+  }, [placedShapes]);
+
+  // Prevents match sound from firing on every update frame when area is exact
+  const matchSoundFiredRef = React.useRef(false);
+
   // Counter text rendered as regular React state — no useAnimatedProps needed
   const [counterText, setCounterText] = useState("0/0");
 
   // ---- JS-thread callbacks (called via runOnJS) ----
 
   const beginDraw = useCallback((col: number, row: number) => {
+    // Guard: ignore if a previous gesture is still resolving on the JS thread
+    if (isProcessingRef.current) return;
+
+    // Rebuild the occupied set synchronously so it's never stale at gesture start
+    occupiedCellsRef.current = buildOccupiedSet(placedShapesRef.current);
+
     const hint = findHintAt(puzzleShapesRef.current, col, row);
     if (!hint) return;
-    if (isCellOccupied(placedShapesRef.current, col, row)) return;
+    if (occupiedCellsRef.current.has(`${col},${row}`)) return;
+
+    isProcessingRef.current = true;
 
     // Anchor point: the hint cell stays inside the rectangle at all times
     hintPosRef.current = { col, row };
@@ -145,13 +205,14 @@ export default function ShapeDrawer({
     startRow.value     = row;
     endCol.value       = col;
     endRow.value       = row;
-    requiredValue.value = hint.value;
     currentArea.value  = 1;
     requiredArea.value = hint.value;
     hasOverlap.value   = false;
     colorIndex.value   = colorIndexRef.current;
+    matchSoundFiredRef.current = false;
     setCounterText(`1/${hint.value}`);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    onCellTouch?.();
+  }, [onCellTouch]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateDraw = useCallback(
     (col: number, row: number, fingerX: number, fingerY: number) => {
@@ -180,15 +241,25 @@ export default function ShapeDrawer({
       counterX.value    = fingerX;
       counterY.value    = fingerY;
 
-      hasOverlap.value = rectangleHasOverlap(
-        placedShapesRef.current,
+      hasOverlap.value = rectangleHasOverlapFast(
+        occupiedCellsRef.current,
         sCol, sRow, eCol, eRow
       );
 
-      // Update counter label directly on JS thread — no animated props needed
-      setCounterText(`${area}/${requiredValue.value}`);
+      // Match sound — fires once per drag when area first equals required
+      if (area === requiredArea.value) {
+        if (!matchSoundFiredRef.current) {
+          matchSoundFiredRef.current = true;
+          onAreaMatch?.();
+        }
+      } else {
+        // Reset so the sound re-fires if player changes size and comes back
+        matchSoundFiredRef.current = false;
+      }
+
+      setCounterText(`${area}/${requiredArea.value}`);
     },
-    [gridSize] // eslint-disable-line react-hooks/exhaustive-deps
+    [gridSize, onAreaMatch] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   const confirmDraw = useCallback(() => {
@@ -201,11 +272,34 @@ export default function ShapeDrawer({
     const width  = eCol - sCol + 1;
     const height = eRow - sRow + 1;
     const area   = width * height;
+    const hasOv  = hasOverlap.value;
 
+    // Clear drawing state and release mutex before any early returns
     isDrawing.value  = false;
     hasOverlap.value = false;
+    isProcessingRef.current = false;
 
-    if (area !== requiredValue.value) return;
+    // Reject: wrong area OR overlap detected
+    if (area !== requiredArea.value || hasOv) {
+      // Trigger red flash on the UI thread at the last known rect position
+      const fl = sCol * cellSize;
+      const ft = sRow * cellSize;
+      const fw = width * cellSize;
+      const fh = height * cellSize;
+      runOnUI(() => {
+        "worklet";
+        rejectLeft.value   = fl;
+        rejectTop.value    = ft;
+        rejectWidth.value  = fw;
+        rejectHeight.value = fh;
+        rejectOpacity.value = withSequence(
+          withTiming(0.75, { duration: 30 }),
+          withTiming(0,    { duration: 300 })
+        );
+      })();
+      onShapeRejected?.();
+      return;
+    }
 
     // Use the stored hint position (not sCol/sRow) to find the puzzle shape
     const hint = findHintAt(
@@ -227,11 +321,12 @@ export default function ShapeDrawer({
     };
 
     onShapeComplete(newShape);
-  }, [onShapeComplete]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [onShapeComplete, onShapeRejected, cellSize]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const cancelDraw = useCallback(() => {
     isDrawing.value  = false;
     hasOverlap.value = false;
+    isProcessingRef.current = false;
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- Pan gesture (worklet → runOnJS → JS thread) ----
@@ -258,9 +353,14 @@ export default function ShapeDrawer({
       "worklet";
       runOnJS(confirmDraw)();
     })
-    .onFinalize(() => {
+    .onFinalize((e) => {
       "worklet";
-      runOnJS(cancelDraw)();
+      // onFinalize fires after BOTH onEnd (success) and on cancel/fail.
+      // Only call cancelDraw for true cancellations — on normal END, confirmDraw
+      // already handled cleanup. Calling cancelDraw after confirmDraw would race.
+      if (e.state !== State.END) {
+        runOnJS(cancelDraw)();
+      }
     });
 
   // ---- Animated style: in-progress rectangle ----
@@ -299,14 +399,34 @@ export default function ShapeDrawer({
     };
   });
 
+  // ---- Animated style: rejection flash rect ----
+
+  const rejectFlashStyle = useAnimatedStyle(() => ({
+    position:        "absolute",
+    left:            rejectLeft.value,
+    top:             rejectTop.value,
+    width:           rejectWidth.value,
+    height:          rejectHeight.value,
+    opacity:         rejectOpacity.value,
+    backgroundColor: "#FC8181",
+    borderRadius:    4,
+    borderWidth:     2,
+    borderColor:     "#FF4444",
+  }));
+
   // ---- Animated style: floating counter badge ----
+  // Clamped so the badge never escapes the grid bounds near the edges.
+  const BADGE_W = 60;
+  const BADGE_H = 30;
 
   const counterContainerStyle = useAnimatedStyle(() => {
     if (!isDrawing.value) return { opacity: 0 };
+    const rawLeft = counterX.value - BADGE_W / 2;
+    const rawTop  = counterY.value - BADGE_H - 10;
     return {
       opacity: 1,
-      left: counterX.value - 28,
-      top:  counterY.value - 48,
+      left: Math.max(0, Math.min(rawLeft, totalPixels - BADGE_W)),
+      top:  Math.max(4, Math.min(rawTop,  totalPixels - BADGE_H)),
     };
   });
 
@@ -322,22 +442,45 @@ export default function ShapeDrawer({
           { width: totalPixels, height: totalPixels },
         ]}
       >
-        {/* Confirmed placed shapes as colored overlays */}
-        {placedShapes.map((shape, idx) => (
-          <Animated.View
-            key={shape.id}
-            style={{
-              position:        "absolute",
-              left:            shape.col * cellSize,
-              top:             shape.row * cellSize,
-              width:           shape.width * cellSize,
-              height:          shape.height * cellSize,
-              backgroundColor: colorForIndex(idx),
-              opacity:         0.65,
-              borderRadius:    3,
-            }}
-          />
-        ))}
+        {/* Confirmed placed shapes — rgba background so the hint text has full opacity */}
+        {placedShapes.map((shape, idx) => {
+          // Pixel position of the hint cell relative to the shape's top-left corner
+          const hintRelLeft = (shape.hintCol - shape.col) * cellSize;
+          const hintRelTop  = (shape.hintRow - shape.row) * cellSize;
+          return (
+            <View
+              key={shape.id}
+              style={{
+                position:        "absolute",
+                left:            shape.col * cellSize,
+                top:             shape.row * cellSize,
+                width:           shape.width * cellSize,
+                height:          shape.height * cellSize,
+                backgroundColor: placedColorForIndex(idx),
+                borderRadius:    3,
+              }}
+            >
+              {/* Hint number — confirms which value this shape solved */}
+              <Text
+                style={{
+                  position:   "absolute",
+                  left:       hintRelLeft,
+                  top:        hintRelTop,
+                  width:      cellSize,
+                  height:     cellSize,
+                  textAlign:  "center",
+                  lineHeight: cellSize,
+                  fontSize:   cellSize * 0.34,
+                  fontWeight: "bold",
+                  color:      "rgba(255,255,255,0.75)",
+                }}
+                numberOfLines={1}
+              >
+                {shape.value}
+              </Text>
+            </View>
+          );
+        })}
 
         {/* In-progress rectangle */}
         <Animated.View
@@ -351,6 +494,9 @@ export default function ShapeDrawer({
             animatedRectStyle,
           ]}
         />
+
+        {/* Rejection flash — briefly shows a red ghost rect when the player releases incorrectly */}
+        <Animated.View style={[styles.rejectFlash, rejectFlashStyle]} />
 
         {/* Floating area counter — regular Text inside Animated.View */}
         <Animated.View
@@ -372,6 +518,10 @@ export default function ShapeDrawer({
 // ---------------------------------------------------------------------------
 
 const styles = StyleSheet.create({
+  rejectFlash: {
+    // Base style only — geometry and opacity come from rejectFlashStyle
+    pointerEvents: "none",
+  },
   counterBadge: {
     position:        "absolute",
     backgroundColor: "rgba(0,0,0,0.75)",

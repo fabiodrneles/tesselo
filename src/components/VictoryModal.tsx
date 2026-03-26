@@ -10,6 +10,8 @@ import {
   StyleSheet,
   Dimensions,
 } from "react-native";
+import { IconCheck } from "../icons";
+import { formatTime } from "../utils/time";
 
 type VictoryModalProps = {
   visible: boolean;
@@ -17,12 +19,6 @@ type VictoryModalProps = {
   timeSeconds: number;
   onNextLevel: () => void;
 };
-
-function formatTime(seconds: number): string {
-  const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
-  const ss = String(seconds % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
-}
 
 export default function VictoryModal({
   visible,
@@ -39,8 +35,8 @@ export default function VictoryModal({
     >
       <View style={styles.overlay}>
         <View style={styles.card}>
-          {/* Check icon */}
-          <Text style={styles.icon}>✓</Text>
+          {/* Check icon SVG */}
+          <IconCheck size={64} color="#68D391" />
 
           {/* Title */}
           <Text style={styles.title}>Nível {level} Completo!</Text>
@@ -84,11 +80,6 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.4,
     shadowRadius: 16,
     elevation: 12,
-  },
-  icon: {
-    color: "#68D391",
-    fontSize: 56,
-    lineHeight: 64,
   },
   title: {
     color: "#FFFFFF",
